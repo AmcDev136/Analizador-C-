@@ -53,9 +53,24 @@ import difflib
 import math
 import os
 import re
+import traceback
 from dataclasses import dataclass, field, replace
 
 DEPURAR = bool(os.environ.get("SEMANTICO_DEPURAR"))   # 1 = no ocultar excepciones internas
+
+
+class ErrorAnalisis(Exception):
+    """Excepción interna del analizador semántico.
+
+    Se lanza cuando el análisis de una declaración o sentencia detecta una
+    condición que impide continuar con ese nodo específico (por ejemplo, un
+    nodo con estructura inesperada proveniente del parser).  ``seguro()``
+    la captura y reanuda el análisis con el nodo siguiente.
+
+    Los errores de *implementación* del compilador (IndexError, AttributeError,
+    KeyError, etc.) NO deben ser capturados: deben propagarse para que sean
+    visibles como bugs reales.
+    """
 
 
 # ═══════════════════════════════ tipos ═══════════════════════════════
@@ -807,17 +822,28 @@ class Analizador:
     def buscar_calificado(self, nombre):
         pre, _, ult = nombre.rpartition("::")
         if pre == "":
+            # Calificación global explícita: ::nombre
             return self.global_.tabla.get(ult, [])
         if pre == "std":
             s = self.biblioteca(ult, None, forzado=True)
-            return [s] if s else [Simbolo(ult, "biblioteca", DESCONOCIDO)]
+            # Si el nombre no existe en la STL conocida, devolver vacío para
+            # que e_ident lo reporte como no declarado en lugar de silenciarlo.
+            return [s] if s else []
         if pre in self.enumeradores and ult in self.enumeradores[pre]:
             return [self.enumeradores[pre][ult]]
         if pre in self.clases:
             return self.miembro(self.clases[pre], ult)
         if pre in self.espacios:
             return self.espacios[pre].tabla.get(ult, [])
-        return [Simbolo(nombre, "biblioteca", DESCONOCIDO)]      # algo que no se puede revisar
+        # El prefijo no fue declarado como clase, espacio de nombres, enum ni std.
+        # Devolver lista vacía para que el llamador (e_ident / no_declarado) emita
+        # el error apropiado en lugar de aceptarlo silenciosamente.
+        # Excepción: prefijos con '::' anidados (p. ej. rutas de plantillas externas
+        # profundas) no se pueden resolver estáticamente; se aceptan como desconocidos
+        # para evitar falsos positivos en código correcto que usa bibliotecas externas.
+        if "::" in pre:
+            return [Simbolo(nombre, "biblioteca", DESCONOCIDO)]
+        return []
 
     def nombres_visibles(self, solo_tipos=False):
         nombres = set()
@@ -1238,19 +1264,41 @@ class Analizador:
                 "pasos": self.pasos}
 
     def seguro(self, fn, *args):
-        """Ejecuta una parte del análisis; si algo inesperado falla, sigue con lo demás."""
+        """Ejecuta una parte del análisis recuperándose ante errores esperados.
+
+        Solo captura ``ErrorAnalisis``, que señala condiciones controladas donde
+        el análisis de un nodo concreto no puede continuar.  Cualquier otra
+        excepción (IndexError, AttributeError, KeyError…) indica un bug en el
+        compilador y se deja propagar con su traza completa, a menos que
+        ``SEMANTICO_DEPURAR`` esté desactivado, en cuyo caso se registra como
+        advertencia para no interrumpir la sesión del usuario.
+        """
         estado = (len(self.pila), self.ctx, self.ciclos, self.switches, len(self.plantillas))
         try:
             return fn(*args)
-        except Exception as ex:          # noqa: BLE001 — el análisis no debe detenerse
-            if DEPURAR:
-                raise
+        except ErrorAnalisis:
+            # Error controlado: restaurar estado y continuar con el siguiente nodo.
             del self.pila[estado[0]:]
             self.ctx, self.ciclos, self.switches = estado[1], estado[2], estado[3]
             del self.plantillas[estado[4]:]
+            return None
+        except Exception as ex:  # Bug inesperado en el compilador.
+            del self.pila[estado[0]:]
+            self.ctx, self.ciclos, self.switches = estado[1], estado[2], estado[3]
+            del self.plantillas[estado[4]:]
+            if DEPURAR:
+                raise
+            # En modo producción: reportar con traza para facilitar diagnóstico,
+            # pero no interrumpir la sesión del usuario.
+            traza = traceback.format_exc(limit=4)
             x = args[0] if args and hasattr(args[0], "linea") else (1, 1, 1)
-            self.paso("Aviso", x, "—", "—", f"Esta parte no se pudo analizar ({type(ex).__name__}); "
-                                            f"se continúa con el resto del programa.", exacto=True)
+            self.paso(
+                "Error interno del compilador", x, "—", type(ex).__name__,
+                f"Bug en el analizador semántico ({type(ex).__name__}: {ex}). "
+                f"Se continúa con el resto del programa. "
+                f"Activa SEMANTICO_DEPURAR=1 para ver la traza completa.\n{traza}",
+                exacto=True,
+            )
             return None
 
     def declaracion(self, n):
