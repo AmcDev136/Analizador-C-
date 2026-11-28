@@ -121,7 +121,7 @@ class App:
         self.construir()
         self.aplicar_tema()
         self.atajos()
-        self.cargar_ejemplo(os.path.join(DIR, "ejemplos", "errores_sintacticos.cpp"))
+        self.cargar_ejemplo(os.path.join(DIR, "ejemplos", "correcto.cpp"))
         self.reiniciar_resultados()
 
     # ═══════════════════════════ construcción ═══════════════════════════
@@ -356,11 +356,24 @@ class App:
         self.t_errores.bind("<<TreeviewSelect>>", self.al_elegir_error)
         self.nb.add(fe, text="Errores")
 
-        for nombre in ("Intermedio", "Consola"):
-            fx = self.pinta(tk.Frame(self.nb), bg="panel")
-            self.pinta(tk.Label(fx, text=f"Pestaña reservada para la fase de {nombre.lower()}.",
-                                font=self.f_ui), bg="panel", fg="tenue").pack(pady=40)
-            self.nb.add(fx, text=nombre, state="disabled")
+        # Código intermedio: panel de solo lectura donde se muestra el C3D generado.
+        fi = self.pinta(tk.Frame(self.nb), bg="panel")
+        self.t_intermedio = self.pinta(
+            tk.Text(fi, font=self.f_mono, bd=0, highlightthickness=0, padx=12,
+                    pady=10, wrap="none", state="disabled"),
+            bg="editor", fg="texto", selectbackground="sel")
+        si_v = ttk.Scrollbar(fi, orient="vertical", command=self.t_intermedio.yview)
+        si_h = ttk.Scrollbar(fi, orient="horizontal", command=self.t_intermedio.xview)
+        self.t_intermedio.configure(yscrollcommand=si_v.set, xscrollcommand=si_h.set)
+        si_v.pack(side="right", fill="y")
+        si_h.pack(side="bottom", fill="x")
+        self.t_intermedio.pack(fill="both", expand=True)
+        self.nb.add(fi, text="Intermedio")
+
+        fc = self.pinta(tk.Frame(self.nb), bg="panel")
+        self.pinta(tk.Label(fc, text="La ejecución / traducción a ensamblador se integrará en una fase posterior.",
+                            font=self.f_ui), bg="panel", fg="tenue").pack(pady=40)
+        self.nb.add(fc, text="Consola", state="disabled")
 
         fb = self.pinta(tk.Frame(self.nb), bg="panel")
         self.bitacora = self.pinta(tk.Text(fb, font=self.f_mono_peq, bd=0, highlightthickness=0, padx=10,
@@ -715,6 +728,10 @@ class App:
         self.bitacora.configure(state="normal")
         self.bitacora.delete("1.0", "end")
         self.bitacora.configure(state="disabled")
+        self.t_intermedio.configure(state="normal")
+        self.t_intermedio.delete("1.0", "end")
+        self.t_intermedio.insert("1.0", "El código intermedio aparecerá aquí después de una compilación sin errores.\n")
+        self.t_intermedio.configure(state="disabled")
         for t in ("err_linea", "err_sub", "actual", "sel_nodo"):
             self.texto.tag_remove(t, "1.0", "end")
         subs = ["listo para analizar", "requiere 0 errores léxicos", "requiere 0 errores sintácticos",
@@ -1030,7 +1047,43 @@ class App:
         self.marcar_lineas(2, 10 ** 6, final=True)
         self.set_fase(2, "error" if n_sem else "ok",
                       f"{len(r['simbolos'])} símbolos · {n_sem} error{'es' if n_sem != 1 else ''}")
-        self.set_fase(3, "bloqueada", "requiere 0 errores semánticos" if n_sem else "módulo por integrar")
+        yield "fase"
+        if n_sem:
+            self.set_fase(3, "bloqueada", "requiere 0 errores semánticos")
+            self.set_fase(4, "bloqueada", "requiere código intermedio")
+            return
+
+        # ─────────── Fase 4: generación de código intermedio ───────────
+        ci = self.cargar_modulo("codigo_intermedio")
+        if ci is None or not hasattr(ci, "generar"):
+            self.set_fase(3, "externa", "no se encontró codigo_intermedio.py")
+            self.set_fase(4, "bloqueada", "requiere código intermedio")
+            return
+        try:
+            ri = ci.generar(s.arbol) or {}
+        except Exception as ex:
+            self.set_fase(3, "error", "falló la generación")
+            self.mensaje(f"codigo_intermedio.generar() lanzó {type(ex).__name__}: {ex}", "error")
+            return
+        r["intermedio"] = ri
+        instrucciones = ri.get("codigo", [])
+        # Mostrar el resultado completo en su propia pestaña, además de animarlo en la bitácora.
+        self.t_intermedio.configure(state="normal")
+        self.t_intermedio.delete("1.0", "end")
+        texto_intermedio = ri.get("texto") or "\n".join(instrucciones)
+        self.t_intermedio.insert("1.0", texto_intermedio if texto_intermedio else "(No se generaron instrucciones.)")
+        self.t_intermedio.configure(state="disabled")
+        self.nb.tab(4, state="normal")
+        self.iniciar_fase(3, max(len(instrucciones), 1), "Generación de código intermedio (tres direcciones)")
+        for i, instruccion in enumerate(instrucciones, 1):
+            self.proceso("Generar instrucción", "operación de tres direcciones", instruccion.strip(), 0, 0,
+                         ["Código intermedio", f"Instrucción {i}"])
+            self.log(f"[Código intermedio] {instruccion}")
+            self.mensaje(instruccion.strip(), "info")
+            self.avanzar_contador(3, 0)
+            yield "paso"
+        self.set_fase(3, "ok", f"{len(instrucciones)} instrucciones · {ri.get('temporales', 0)} temporales")
+        self.set_fase(4, "bloqueada", "pendiente: traducción a ensamblador / ejecución")
         yield "fase"
 
     def cargar_modulo(self, nombre):
@@ -1054,7 +1107,11 @@ class App:
         else:
             self.l_estado.config(text=f"Terminado sin errores · fases completadas: {ult + 1} de 5")
             self.proceso("Análisis completo", "EOF", "fin de archivo", 0, 0, ["Programa"])
-            if self.estado_fases[2] == "ok":
+            if self.estado_fases[3] == "ok":
+                self.mensaje("✓ Compilación correcta. El código intermedio de tres direcciones ya está generado.", "ok")
+                self.nb.select(4)
+                self.ayuda("Aquí puedes revisar y copiar las instrucciones intermedias. La siguiente fase será traducirlas a ensamblador.")
+            elif self.estado_fases[2] == "ok":
                 self.mensaje("✓ El código no tiene errores léxicos, sintácticos ni semánticos. "
                              "Revisa la tabla de símbolos generada.", "ok")
                 self.nb.select(2)
